@@ -17,7 +17,7 @@ jobs:
             jq -rc .label.name $GITHUB_EVENT_PATH | cut -d/ -f 2
           )"
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
         with:
           ref: ${{ github.event.pull_request.head.ref }}
           fetch-depth: 2
@@ -46,7 +46,7 @@ jobs:
             jq -rc .label.name $GITHUB_EVENT_PATH | cut -d/ -f 2
           )"
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
         with:
           ref: ${{ github.event.pull_request.head.ref }}
           fetch-depth: 2
@@ -80,7 +80,7 @@ jobs:
             jq -rc .label.name $GITHUB_EVENT_PATH | cut -d/ -f 2
           )"
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
         with:
           ref: ${{ github.event.pull_request.head.ref }}
           fetch-depth: 2
