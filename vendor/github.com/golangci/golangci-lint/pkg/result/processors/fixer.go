@@ -10,6 +10,7 @@ import (
 
 	"github.com/pkg/errors"
 
+	"github.com/golangci/golangci-lint/internal/robustio"
 	"github.com/golangci/golangci-lint/pkg/config"
 	"github.com/golangci/golangci-lint/pkg/fsutils"
 	"github.com/golangci/golangci-lint/pkg/logutils"
@@ -57,7 +58,7 @@ func (f Fixer) Process(issues []result.Issue) []result.Issue {
 	for file, issuesToFix := range issuesToFixPerFile {
 		var err error
 		f.sw.TrackStage("all", func() {
-			err = f.fixIssuesInFile(file, issuesToFix) //nolint:scopelint
+			err = f.fixIssuesInFile(file, issuesToFix)
 		})
 		if err != nil {
 			f.log.Errorf("Failed to fix issues in file %s: %s", file, err)
@@ -104,13 +105,13 @@ func (f Fixer) fixIssuesInFile(filePath string, issues []result.Issue) error {
 
 	if err = f.writeFixedFile(origFileLines, issues, tmpOutFile); err != nil {
 		tmpOutFile.Close()
-		os.Remove(tmpOutFile.Name())
+		_ = robustio.RemoveAll(tmpOutFile.Name())
 		return err
 	}
 
 	tmpOutFile.Close()
-	if err = os.Rename(tmpOutFile.Name(), filePath); err != nil {
-		os.Remove(tmpOutFile.Name())
+	if err = robustio.Rename(tmpOutFile.Name(), filePath); err != nil {
+		_ = robustio.RemoveAll(tmpOutFile.Name())
 		return errors.Wrapf(err, "failed to rename %s -> %s", tmpOutFile.Name(), filePath)
 	}
 
@@ -185,7 +186,7 @@ func (f Fixer) applyInlineFixes(lineIssues []result.Issue, origLine []byte, line
 
 func (f Fixer) findNotIntersectingIssues(issues []result.Issue) []result.Issue {
 	sort.SliceStable(issues, func(i, j int) bool {
-		a, b := issues[i], issues[j] //nolint:scopelint
+		a, b := issues[i], issues[j]
 		return a.Line() < b.Line()
 	})
 
