@@ -4,11 +4,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/json"
-	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/fatih/color"
@@ -16,6 +15,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
+	"gopkg.in/yaml.v3"
 
 	"github.com/golangci/golangci-lint/internal/cache"
 	"github.com/golangci/golangci-lint/internal/pkgcache"
@@ -31,13 +31,14 @@ import (
 )
 
 type Executor struct {
-	rootCmd *cobra.Command
-	runCmd  *cobra.Command
+	rootCmd    *cobra.Command
+	runCmd     *cobra.Command
+	lintersCmd *cobra.Command
 
 	exitCode              int
 	version, commit, date string
 
-	cfg               *config.Config
+	cfg               *config.Config // cfg is the unmarshaled data from the golangci config file.
 	log               logutils.Log
 	reportData        report.Data
 	DBManager         *lintersdb.Manager
@@ -54,21 +55,20 @@ type Executor struct {
 	flock     *flock.Flock
 }
 
+// NewExecutor creates and initializes a new command executor.
 func NewExecutor(version, commit, date string) *Executor {
+	startedAt := time.Now()
 	e := &Executor{
 		cfg:       config.NewDefault(),
 		version:   version,
 		commit:    commit,
 		date:      date,
 		DBManager: lintersdb.NewManager(nil, nil),
-		debugf:    logutils.Debug("exec"),
+		debugf:    logutils.Debug(logutils.DebugKeyExec),
 	}
 
 	e.debugf("Starting execution...")
-	e.log = report.NewLogWrapper(logutils.NewStderrLog(""), &e.reportData)
-	if ok := e.acquireFileLock(); !ok {
-		e.log.Fatalf("Parallel golangci-lint is running")
-	}
+	e.log = report.NewLogWrapper(logutils.NewStderrLog(logutils.DebugKeyEmpty), &e.reportData)
 
 	// to setup log level early we need to parse config from command line extra time to
 	// find `-v` option
@@ -98,7 +98,6 @@ func NewExecutor(version, commit, date string) *Executor {
 	e.initHelp()
 	e.initLinters()
 	e.initConfig()
-	e.initCompletion()
 	e.initVersion()
 	e.initCache()
 
@@ -106,40 +105,40 @@ func NewExecutor(version, commit, date string) *Executor {
 	// like the default ones. It will overwrite them only if the same option
 	// is found in command-line: it's ok, command-line has higher priority.
 
-	r := config.NewFileReader(e.cfg, commandLineCfg, e.log.Child("config_reader"))
+	r := config.NewFileReader(e.cfg, commandLineCfg, e.log.Child(logutils.DebugKeyConfigReader))
 	if err = r.Read(); err != nil {
 		e.log.Fatalf("Can't read config: %s", err)
+	}
+
+	if (commandLineCfg == nil || commandLineCfg.Run.Go == "") && e.cfg != nil && e.cfg.Run.Go == "" {
+		e.cfg.Run.Go = config.DetectGoVersion()
 	}
 
 	// recreate after getting config
 	e.DBManager = lintersdb.NewManager(e.cfg, e.log).WithCustomLinters()
 
-	e.cfg.LintersSettings.Gocritic.InferEnabledChecks(e.log)
-	if err = e.cfg.LintersSettings.Gocritic.Validate(e.log); err != nil {
-		e.log.Fatalf("Invalid gocritic settings: %s", err)
-	}
-
 	// Slice options must be explicitly set for proper merging of config and command-line options.
 	fixSlicesFlags(e.runCmd.Flags())
+	fixSlicesFlags(e.lintersCmd.Flags())
 
 	e.EnabledLintersSet = lintersdb.NewEnabledSet(e.DBManager,
-		lintersdb.NewValidator(e.DBManager), e.log.Child("lintersdb"), e.cfg)
-	e.goenv = goutil.NewEnv(e.log.Child("goenv"))
+		lintersdb.NewValidator(e.DBManager), e.log.Child(logutils.DebugKeyLintersDB), e.cfg)
+	e.goenv = goutil.NewEnv(e.log.Child(logutils.DebugKeyGoEnv))
 	e.fileCache = fsutils.NewFileCache()
 	e.lineCache = fsutils.NewLineCache(e.fileCache)
 
-	e.sw = timeutils.NewStopwatch("pkgcache", e.log.Child("stopwatch"))
-	e.pkgCache, err = pkgcache.NewCache(e.sw, e.log.Child("pkgcache"))
+	e.sw = timeutils.NewStopwatch("pkgcache", e.log.Child(logutils.DebugKeyStopwatch))
+	e.pkgCache, err = pkgcache.NewCache(e.sw, e.log.Child(logutils.DebugKeyPkgCache))
 	if err != nil {
 		e.log.Fatalf("Failed to build packages cache: %s", err)
 	}
 	e.loadGuard = load.NewGuard()
-	e.contextLoader = lint.NewContextLoader(e.cfg, e.log.Child("loader"), e.goenv,
+	e.contextLoader = lint.NewContextLoader(e.cfg, e.log.Child(logutils.DebugKeyLoader), e.goenv,
 		e.lineCache, e.fileCache, e.pkgCache, e.loadGuard)
 	if err = e.initHashSalt(version); err != nil {
 		e.log.Fatalf("Failed to init hash salt: %s", err)
 	}
-	e.debugf("Initialized executor")
+	e.debugf("Initialized executor in %s", time.Since(startedAt))
 	return e
 }
 
@@ -170,7 +169,7 @@ func computeBinarySalt(version string) ([]byte, error) {
 		return []byte(version), nil
 	}
 
-	if logutils.HaveDebugTag("bin_salt") {
+	if logutils.HaveDebugTag(logutils.DebugKeyBinSalt) {
 		return []byte("debug"), nil
 	}
 
@@ -191,27 +190,45 @@ func computeBinarySalt(version string) ([]byte, error) {
 }
 
 func computeConfigSalt(cfg *config.Config) ([]byte, error) {
-	configBytes, err := json.Marshal(cfg)
+	// We don't hash all config fields to reduce meaningless cache
+	// invalidations. At least, it has a huge impact on tests speed.
+
+	lintersSettingsBytes, err := yaml.Marshal(cfg.LintersSettings)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to json marshal config")
+		return nil, errors.Wrap(err, "failed to json marshal config linter settings")
 	}
 
+	var configData bytes.Buffer
+	configData.WriteString("linters-settings=")
+	configData.Write(lintersSettingsBytes)
+	configData.WriteString("\nbuild-tags=%s" + strings.Join(cfg.Run.BuildTags, ","))
+
 	h := sha256.New()
-	if n, err := h.Write(configBytes); n != len(configBytes) {
-		return nil, fmt.Errorf("failed to hash config bytes: wrote %d/%d bytes, error: %s", n, len(configBytes), err)
+	if _, err := h.Write(configData.Bytes()); err != nil {
+		return nil, err
 	}
 	return h.Sum(nil), nil
 }
 
 func (e *Executor) acquireFileLock() bool {
+	if e.cfg.Run.AllowParallelRunners {
+		e.debugf("Parallel runners are allowed, no locking")
+		return true
+	}
+
 	lockFile := filepath.Join(os.TempDir(), "golangci-lint.lock")
 	e.debugf("Locking on file %s...", lockFile)
 	f := flock.New(lockFile)
-	ctx, finish := context.WithTimeout(context.Background(), time.Minute)
-	defer finish()
+	const retryDelay = time.Second
 
-	timeout := time.Second * 3
-	if ok, _ := f.TryLockContext(ctx, timeout); !ok {
+	ctx := context.Background()
+	if !e.cfg.Run.AllowSerialRunners {
+		const totalTimeout = 5 * time.Second
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, totalTimeout)
+		defer cancel()
+	}
+	if ok, _ := f.TryLockContext(ctx, retryDelay); !ok {
 		return false
 	}
 
@@ -220,6 +237,10 @@ func (e *Executor) acquireFileLock() bool {
 }
 
 func (e *Executor) releaseFileLock() {
+	if e.cfg.Run.AllowParallelRunners {
+		return
+	}
+
 	if err := e.flock.Unlock(); err != nil {
 		e.debugf("Failed to unlock on file: %s", err)
 	}
